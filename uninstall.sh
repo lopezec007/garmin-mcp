@@ -2,8 +2,9 @@
 # Remove the garmin-mcp service installed by install.sh.
 #
 #   sudo ./uninstall.sh            remove the service, the program and the wrapper;
-#                                  keep the config and the Garmin tokens
-#   sudo ./uninstall.sh --purge    also remove the config, the tokens and the
+#                                  keep the config and the state (Garmin tokens,
+#                                  OAuth clients and owner password)
+#   sudo ./uninstall.sh --purge    also remove the config, the state and the
 #                                  garmin-mcp user and group
 
 set -euo pipefail
@@ -31,8 +32,9 @@ Usage: sudo ./uninstall.sh [--purge]
 
 Remove the garmin-mcp systemd service, $PREFIX and $WRAPPER.
 
-  --purge      also remove $CONF_DIR (config), $STATE_DIR (Garmin tokens),
-               unit drop-ins and the $RUN_USER user and group
+  --purge      also remove $CONF_DIR (config), $STATE_DIR (Garmin tokens,
+               OAuth clients and owner password), unit drop-ins and the
+               $RUN_USER user and group
   -h, --help   show this help
 EOF
 }
@@ -100,7 +102,7 @@ if $purge; then
         groupdel "$RUN_USER" || warn "could not remove group $RUN_USER"
     fi
     echo
-    echo "garmin-mcp is removed, including its config and tokens."
+    echo "garmin-mcp is removed, including its config, Garmin tokens and OAuth clients."
 else
     echo
     echo "garmin-mcp is removed. Kept (re-used if you install again):"
@@ -108,7 +110,7 @@ else
         echo "  $CONF_DIR   config, including the bearer token and any stored password"
     fi
     if [[ -e $STATE_DIR ]]; then
-        echo "  $STATE_DIR   Garmin tokens"
+        echo "  $STATE_DIR   Garmin tokens, OAuth clients and owner password"
     fi
     if [[ -e $DROPIN_DIR ]]; then
         echo "  $DROPIN_DIR   your unit drop-ins"

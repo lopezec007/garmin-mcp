@@ -25,11 +25,15 @@ Restart=on-failure
 RestartSec=15
 
 # /var/lib/garmin-mcp, owned by the service user. systemd exports it as
-# $STATE_DIRECTORY and the app keeps its Garmin tokens in $STATE_DIRECTORY/tokens.
+# $STATE_DIRECTORY and the app keeps its Garmin tokens in $STATE_DIRECTORY/tokens
+# and, with OAuth on, its SQLite database in $STATE_DIRECTORY/oauth.db.
 # It is the only path the service can write to besides its private /tmp.
 StateDirectory=garmin-mcp
 StateDirectoryMode=0700
 UMask=0077
+# Normal use stays far below this (about 100 MiB). The cap keeps a flood of
+# requests from the internet from taking the rest of the machine down with it.
+MemoryMax=1G
 
 # --- Sandboxing -------------------------------------------------------------
 # The service needs: outbound HTTPS, one unprivileged listening TCP port, and
@@ -73,7 +77,8 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # System calls. These two groups are the ones that tend to break CPython with
 # native extensions (here curl_cffi, cryptography, pydantic-core). Both were
 # tested against this app: imports, DNS, HTTPS through curl_cffi and through
-# requests, and the running server all work with them. If a dependency upgrade
+# requests, the running server, and the OAuth side (SQLite in WAL mode, scrypt
+# password hashing) all work with them. If a dependency upgrade
 # ever makes the service fail with an unexpected "Operation not permitted" or
 # "Permission denied", switch these off first, in a drop-in
 # (`sudo systemctl edit garmin-mcp`):

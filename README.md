@@ -2,8 +2,14 @@
 
 An MCP server that gives MCP clients read-only access to one person's Garmin
 Connect account (activities, sleep, heart rate, training metrics and so on). It
-serves the MCP streamable HTTP transport on the home network and runs as a
-sandboxed systemd service on a Debian 13 machine, without containers.
+serves the MCP streamable HTTP transport and runs as a sandboxed systemd
+service on a Debian 13 machine, without containers.
+
+Out of the box it is a service for the home network, protected by a bearer
+token. It can also be opened to the internet behind a TLS reverse proxy: it is
+then its own OAuth 2.1 authorization server, and every client has to be
+approved in a browser with a password that only the owner knows. See
+[Public access with OAuth](#public-access-with-oauth).
 
 It talks to Garmin through the unofficial
 [`garminconnect`](https://github.com/cyberjunky/python-garminconnect) library,
@@ -52,6 +58,9 @@ on `/healthz`. It ends by printing the steps that are still open. They are:
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
    ```
 
+That is a complete setup for the home network. To use the server from outside
+it, continue with [Public access with OAuth](#public-access-with-oauth).
+
 What ends up where:
 
 | Path | Contents |
@@ -60,8 +69,9 @@ What ends up where:
 | `/etc/garmin-mcp/garmin-mcp.env` | Settings and secrets, `root:garmin-mcp`, mode 0640. Created on first install, never overwritten. |
 | `/etc/garmin-mcp/garmin-mcp.env.example` | Current reference copy of the settings file, refreshed on every install. |
 | `/var/lib/garmin-mcp/tokens` | Garmin tokens. Owned by `garmin-mcp`, mode 0700. |
+| `/var/lib/garmin-mcp/oauth.db` | OAuth state: registered clients (including, for clients that have one, their client secret), hashed tokens and the hash of the owner password. An SQLite database; the `oauth.db-wal` and `oauth.db-shm` files next to it are part of it. Owned by `garmin-mcp`, mode 0600. Created when OAuth is first used. |
 | `/etc/systemd/system/garmin-mcp.service` | The unit. Overwritten on every install; put local changes in a drop-in (`sudo systemctl edit garmin-mcp`). |
-| `/usr/local/bin/garmin-mcp` | Admin wrapper for `sudo garmin-mcp login` and `sudo garmin-mcp check`. |
+| `/usr/local/bin/garmin-mcp` | Admin wrapper for `sudo garmin-mcp login`, `check`, `set-password`, `clients` and `revoke`. |
 
 ## Configuration
 
@@ -76,8 +86,13 @@ Every one is optional. Restart the service after a change
 | `GARMIN_IS_CN` | `false` | `true` for accounts on Garmin's China region. |
 | `GARMIN_TOKEN_DIR` | `/var/lib/garmin-mcp/tokens` | Where tokens are saved. Under systemd the default is `$STATE_DIRECTORY/tokens`; outside systemd it is `~/.garminconnect`. Leave unset on the server: the sandbox allows writes nowhere else. |
 | `GARMIN_MCP_LOGIN_COOLDOWN` | `300` | Seconds to wait after a failed Garmin login before trying again. |
-| `GARMIN_MCP_AUTH_TOKEN` | unset | Shared secret. When set, every MCP request needs `Authorization: Bearer <token>`. Unset means no authentication. |
-| `GARMIN_MCP_ALLOWED_HOSTS` | unset | Comma-separated allowlist for the HTTP `Host` header, entries of the form `host:port` or `host:*`. Unset accepts any host. |
+| `GARMIN_MCP_AUTH_TOKEN` | unset | Shared secret: an MCP request that carries `Authorization: Bearer <token>` is let in. Without `GARMIN_MCP_PUBLIC_URL`, unset means no authentication at all. With it, the token is a second way in next to OAuth, and unset leaves OAuth as the only one. |
+| `GARMIN_MCP_ALLOWED_HOSTS` | unset | Comma-separated allowlist for the HTTP `Host` header on the MCP endpoint. An entry is `host:port`, `host:*` (any port, but the header must have one) or a bare `host` (a name used without a port, such as the public name behind a TLS proxy). Unset accepts any host. |
+| `GARMIN_MCP_PUBLIC_URL` | unset | The https origin the server is reachable at from the internet, for example `https://garmin.example.com`: scheme and host name, no path. Setting it turns on OAuth; the public endpoint is this value plus `GARMIN_MCP_PATH`. Plain `http` is accepted for `localhost` only. With a value that is not usable the service exits with a configuration error. |
+| `GARMIN_MCP_TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated addresses or networks of the reverse proxies whose `X-Forwarded-For` header is believed. Only needs changing when the proxy runs on another machine. |
+| `GARMIN_MCP_OAUTH_ACCESS_TTL` | `3600` | Lifetime of an OAuth access token in seconds (at least 60). |
+| `GARMIN_MCP_OAUTH_REFRESH_TTL` | `2592000` | Lifetime of an OAuth refresh token in seconds (30 days; not shorter than the access token's). |
+| `GARMIN_MCP_OAUTH_DB` | `/var/lib/garmin-mcp/oauth.db` | The OAuth database. Under systemd the default is `$STATE_DIRECTORY/oauth.db`; outside systemd it is `~/.local/state/garmin-mcp/oauth.db`. Leave unset on the server, for the same reason as `GARMIN_TOKEN_DIR`. |
 | `GARMIN_MCP_HOST` | `0.0.0.0` | Address to bind. |
 | `GARMIN_MCP_PORT` | `8765` | TCP port. |
 | `GARMIN_MCP_PATH` | `/mcp` | URL path of the MCP endpoint. |
@@ -124,12 +139,19 @@ the service clears the wait; a successful `sudo garmin-mcp login` restarts it
 for you. If Garmin is rate-limiting logins (HTTP 429), wait before you try
 again rather than repeating the login.
 
+None of this has anything to do with the owner password of
+[Public access with OAuth](#public-access-with-oauth): that one decides who may
+use this server, and Garmin never sees it.
+
 ## Connecting clients
 
-The endpoint is `http://<server-ip>:8765/mcp`, using the MCP streamable HTTP
-transport. The server is stateless, so clients keep working across service
-restarts. If `GARMIN_MCP_AUTH_TOKEN` is set, each request must carry
-`Authorization: Bearer <token>`.
+The server speaks the MCP streamable HTTP transport and is stateless, so
+clients keep working across service restarts. There are two ways for a client
+to get in.
+
+**Bearer token, on the home network.** The endpoint is
+`http://<server-ip>:8765/mcp`. If `GARMIN_MCP_AUTH_TOKEN` is set, each request
+must carry `Authorization: Bearer <token>`.
 
 Claude Code:
 
@@ -155,33 +177,337 @@ Clients configured through an `mcpServers` JSON block:
 ```
 
 Any client that supports streamable HTTP with custom headers can connect this
-way. A client that only accepts HTTPS or publicly reachable URLs needs a
-reverse proxy with TLS in front of the service; that is outside the scope of
-this repository. With a proxy on the same machine, set
-`GARMIN_MCP_HOST=127.0.0.1` so that only the proxy can reach the service.
+way.
+
+**OAuth, through the public URL.** Once
+[public access](#public-access-with-oauth) is set up, the endpoint is
+`https://garmin.example.com/mcp`, and an MCP client that implements the MCP
+authorization flow (OAuth 2.1 with dynamic client registration) needs nothing
+but that URL:
+
+```sh
+claude mcp add --transport http garmin https://garmin.example.com/mcp
+```
+
+The client discovers the sign-in endpoints from the URL, registers itself, and
+sends your browser to the approval page, where you type the owner password.
+This is the way in for clients that only accept HTTPS or publicly reachable
+servers.
+
+The header method keeps working while `GARMIN_MCP_AUTH_TOKEN` is set, on the
+public URL as well as on the LAN address, for clients and scripts that cannot
+do OAuth. OAuth sign-in is tied to the public URL: a client that is pointed at
+the LAN address has to send the header.
+
+## Public access with OAuth
+
+Setting `GARMIN_MCP_PUBLIC_URL` makes the server an OAuth 2.1 authorization
+server for itself. It then serves, next to `/mcp`:
+
+- the discovery documents `/.well-known/oauth-protected-resource/mcp` and
+  `/.well-known/oauth-authorization-server`,
+- `/register` (dynamic client registration), `/authorize`, `/token` and
+  `/revoke`,
+- the approval page `/oauth/login`.
+
+A client that is given the endpoint URL works out the rest by itself. What you
+do is approve it: the browser opens the approval page, you type the **owner
+password** and click Approve. The owner password is a password for this server
+only. It is not the Garmin password, and it is set on the server with
+`sudo garmin-mcp set-password`.
+
+### Prerequisites
+
+- **A DNS name** for the server, for example `garmin.example.com`, that
+  resolves to the machine (or to the tunnel, see below). The server needs the
+  whole host name: it cannot live under a sub-path such as
+  `https://example.com/garmin/`.
+- **TLS in front of the server.** The server itself still speaks plain HTTP on
+  port 8765. Something has to terminate HTTPS and pass the requests on:
+
+  - A reverse proxy with a certificate on the same machine. Caddy takes the
+    least effort on Debian: `sudo apt install caddy`, put this in
+    `/etc/caddy/Caddyfile`, and run `sudo systemctl reload caddy`.
+
+    ```
+    garmin.example.com {
+        reverse_proxy 127.0.0.1:8765
+    }
+    ```
+
+    Caddy gets and renews a Let's Encrypt certificate by itself. For that the
+    name must resolve to the machine, and ports 80 and 443 must be reachable
+    from the internet (forward them on the router; do not forward 8765).
+  - Or a tunnel service that terminates TLS on its side and forwards to
+    `http://127.0.0.1:8765`. No inbound port is needed then. Follow the
+    service's own documentation; the requirements below are the same.
+
+  Whatever sits in front must forward every path at the root of the host name
+  unchanged (no prefix, no rewriting), keep the `Host` header, and put the
+  client's address in `X-Forwarded-For`. Caddy's `reverse_proxy` does all of
+  that without further settings.
+
+### Setup
+
+1. Edit `/etc/garmin-mcp/garmin-mcp.env`:
+
+   ```
+   GARMIN_MCP_PUBLIC_URL=https://garmin.example.com
+   GARMIN_MCP_HOST=127.0.0.1
+   ```
+
+   `GARMIN_MCP_PUBLIC_URL` is the bare origin: no path and no trailing `/mcp`.
+   `GARMIN_MCP_HOST=127.0.0.1` makes the plain-HTTP port reachable through the
+   local proxy only. Leave it at `0.0.0.0` only if clients on the LAN still
+   connect to port 8765 directly with the bearer token. If you use
+   `GARMIN_MCP_ALLOWED_HOSTS`, add the public name to it as a bare
+   `garmin.example.com`.
+
+   The proxy on the same machine is trusted to report client addresses by
+   default. If the proxy runs on another machine, also set
+   `GARMIN_MCP_TRUSTED_PROXIES` to its address.
+
+2. Set the owner password:
+
+   ```sh
+   sudo garmin-mcp set-password
+   ```
+
+   It asks twice and wants at least 12 characters. Only a hash is stored (in
+   `/var/lib/garmin-mcp/oauth.db`). When it is not run from a terminal it
+   reads the password as one line from standard input instead. Run it again
+   at any time to change the password: the change applies at once, without a
+   restart, and does not sign out clients that are already authorized.
+
+3. Restart and look at the log:
+
+   ```sh
+   sudo systemctl restart garmin-mcp
+   journalctl -u garmin-mcp -e
+   ```
+
+   It should say `OAuth enabled: public endpoint https://garmin.example.com/mcp`.
+   A warning that no owner password is set means step 2 is still open; until
+   then nobody can authorize a client.
+
+4. Check from a machine outside your network:
+
+   ```sh
+   curl https://garmin.example.com/healthz
+   curl https://garmin.example.com/.well-known/oauth-protected-resource/mcp
+   curl https://garmin.example.com/.well-known/oauth-authorization-server
+   curl -i -X POST https://garmin.example.com/mcp
+   ```
+
+   The first document must name `"resource":"https://garmin.example.com/mcp"`,
+   exactly the URL you will give to clients. Every URL in the second must
+   start with `https://garmin.example.com`. The last command must answer
+   `401` with a `WWW-Authenticate` header that points at the first document:
+   that is how clients find the sign-in.
+
+5. Add the server to a client by URL only, as shown under
+   [Connecting clients](#connecting-clients), and approve it.
+
+### The approval page
+
+When a client asks for access, your browser shows a page with:
+
+- the name of the application. The application picks that name itself when it
+  registers, and nothing verifies it: anything can call itself anything.
+- where the browser will be sent after approval. This is the part to read,
+  because the code that grants access goes there and nowhere else. For a
+  hosted service it is that service's own domain; for a program on your own
+  computer it is `localhost` or `127.0.0.1` with a port. Only the host is
+  shown, so it cannot be dressed up with a misleading prefix. For an app with
+  its own URL scheme (`cursor://...`) the whole link is shown instead, with a
+  note that it is not a web address.
+- how long ago the request was started.
+- a field for the owner password, and the buttons Approve and Deny.
+
+Approve only when you started the connection yourself a moment ago and the
+destination fits the application you are connecting. If the page appears
+without your doing, or the destination is a domain you do not recognise, click
+Deny or close it. **A link to the approval page that someone sends you is
+always an attack**, however genuine the page looks: the page is real, but the
+access would go to whoever started that request. Nothing is granted without
+the password.
+
+The page is valid for 5 minutes and for one approval. There is no login
+session: every approval asks for the password again. Approving a client that
+was already authorized replaces its earlier sign-in.
+
+### Managing clients
+
+```sh
+sudo garmin-mcp clients              # list the authorized clients
+sudo garmin-mcp revoke <client_id>   # sign one out and forget it
+sudo garmin-mcp revoke --all         # sign out every client
+```
+
+`clients` prints, for each client you approved, its id, the name it gave
+itself, when it was authorized, when it last got a token, until when it stays
+signed in, and its redirect URIs. `revoke` takes the id from that list. A
+revoked client is cut off at once and has to register and be approved again.
+None of these commands needs a restart.
+
+If the owner password may have leaked, set a new one first, then run
+`sudo garmin-mcp revoke --all` and approve your clients again.
+
+### Token lifetimes
+
+- An access token, which the client sends with every request, lives 1 hour
+  (`GARMIN_MCP_OAUTH_ACCESS_TTL`).
+- A refresh token, with which the client gets the next access token without
+  asking you, lives 30 days (`GARMIN_MCP_OAUTH_REFRESH_TTL`) and is replaced
+  by a new one every time it is used. If a refresh token that was already
+  replaced shows up again more than a minute later, it has been copied, and
+  the server signs that client out entirely (it logs "Rotated refresh token
+  replayed"); the client then has to be approved again.
+
+So a client stays signed in for as long as it is used at least once every 30
+days, and has to be approved again after a longer pause. Authorized clients
+survive service restarts and upgrades. A changed lifetime applies to tokens
+issued after the restart. The static `GARMIN_MCP_AUTH_TOKEN` is not an OAuth
+token and never expires.
+
+### Troubleshooting
+
+- **`/mcp` answers 401.** Expected for a request without a valid token; it is
+  the client's cue to start the sign-in. A client that reports only "401" or
+  "unauthorized" probably does not implement the OAuth flow: use the bearer
+  token header with it.
+- **The page says "Not set up yet" / no owner password.** Run
+  `sudo garmin-mcp set-password` on the server, then start connecting again
+  from the client.
+- **The page says "Too many attempts".** Five wrong passwords from one address
+  lock that address out until 15 minutes after the first of them (see
+  [Security notes](#security-notes)). Wait, or restart the service, which
+  clears the counters. If it happens although you did not mistype, either
+  someone else is guessing and the overall limit is reached, or other visitors
+  are counted under your address because the proxy does not pass
+  `X-Forwarded-For` or is not listed in `GARMIN_MCP_TRUSTED_PROXIES`. The
+  log shows which.
+- **The page says "Request expired".** The approval page was open for more
+  than 5 minutes, was already used, or the service was restarted in between.
+  Start connecting again from the client.
+- **The client fails before any page opens, or the browser goes to the wrong
+  host.** `GARMIN_MCP_PUBLIC_URL` does not match the URL clients use. The
+  discovery documents are built from that setting, not from the request, so a
+  wrong value sends clients to the wrong place. Compare the output of the
+  `curl` commands in step 4 with the URL you gave the client: scheme, host
+  name and path must be identical.
+- **The service does not start after the change.** `journalctl -u garmin-mcp -e`
+  shows a line starting with `configuration error` that names the problem,
+  usually a `GARMIN_MCP_PUBLIC_URL` with a path, or `http` instead of `https`.
+- **The proxy serves the server under a sub-path** (for example
+  `https://example.com/garmin/`). That cannot work: the discovery documents
+  must be at `/.well-known/...` of the host, and a `GARMIN_MCP_PUBLIC_URL`
+  with a path is refused. Give the server a host name of its own.
+- **`/mcp` answers 421 "Invalid Host header".** `GARMIN_MCP_ALLOWED_HOSTS` is
+  set and lacks the public name. Add it without a port
+  (`garmin.example.com`); the `host:*` form does not match a name that
+  arrives without a port.
+- **A client that worked asks to sign in again.** It was not used for 30
+  days, it was revoked, the same client was approved again elsewhere, one of
+  its refresh tokens was replayed (see [Token lifetimes](#token-lifetimes)),
+  or `/var/lib/garmin-mcp/oauth.db` was removed.
+- **Registering a client fails with "too many pending registrations".**
+  Someone is flooding `/register`. Registrations made in the last 15 minutes
+  are never dropped to make room, so sign-ins already in progress finish, but
+  new clients have to wait. Rate-limit `/register` in the reverse proxy if it
+  keeps happening.
+- **Who tried?** Failed and refused attempts on the approval page are logged
+  with the client address:
+  `journalctl -u garmin-mcp | grep -i 'login attempt'`.
 
 ## Security notes
 
+For the home network only (no `GARMIN_MCP_PUBLIC_URL`):
+
 - **Plain HTTP.** Requests, responses and the bearer token cross the LAN
   unencrypted. That is acceptable on a home network you trust and nowhere else.
-  Do not forward the port to the internet.
+  Do not forward port 8765 to the internet.
 - **Bearer token.** Without `GARMIN_MCP_AUTH_TOKEN`, anyone who can reach the
   port can read the account's health data. The service logs a warning at
-  startup while the token is unset. `/healthz` is always open and returns only
-  a status and the version.
+  startup while the token is unset.
+
+With public access:
+
+- **What protects the data.** The owner password and TLS, nothing else. Anyone
+  on the internet can reach the approval page, and whoever knows the password
+  can authorize a client and read the account's health data. Choose a long
+  password that is used nowhere else (a generated one from a password manager;
+  the minimum of 12 characters is a floor, not a target), and not the Garmin
+  password. It is stored only as an scrypt hash.
+- **TLS is not optional.** The password and the tokens travel in requests to
+  the server. Expose the server only through the TLS proxy or tunnel, never by
+  forwarding port 8765, and bind it to `127.0.0.1` when the proxy is on the
+  same machine. `GARMIN_MCP_PUBLIC_URL` must be `https` for the same reason.
+- **Password guessing is rate limited:** 5 failed attempts per client address
+  (per /64 network for IPv6) and 100 overall per 15 minutes; after that the
+  page refuses further tries until the oldest ones age out. The counters are
+  kept in memory, so a restart resets them. Form posts that a browser marks as
+  coming from another site are refused outright and do not count. The
+  per-address limit depends on the real client address, which
+  comes from `X-Forwarded-For` and is believed only from the addresses in
+  `GARMIN_MCP_TRUSTED_PROXIES`. With a proxy on another machine that is not
+  listed there, all visitors share one address and one limit. The overall
+  limit also means that someone who keeps guessing can keep you from approving
+  new clients for a while; clients that are already authorized are not
+  affected. The rate limits slow guessing down; they do not make a weak
+  password safe.
+- **Registration is open.** Any OAuth client on the internet can register
+  itself at `/register`; MCP clients depend on that. Registering grants
+  nothing: every authorization needs the owner password. What a client may
+  register is restricted: redirect targets must be `https`, `http` on
+  localhost, or an app-specific scheme, without a user-info part, and names
+  and sizes are capped. Registrations that were never approved are capped at
+  2000 and dropped after a day. The limits bound what a flood can cost; they
+  do not stop one, so put a request rate limit on the reverse proxy if the
+  server attracts that kind of attention. The service is also capped at 1 GiB
+  of memory (`MemoryMax=` in the unit).
+- **Phishing is the realistic attack.** Nobody can get in without the
+  password, so an attacker's best move is to get you to type it for them: by
+  starting a sign-in from their own client and sending you the approval link.
+  The page cannot tell who started a request. Treat any approval link you did
+  not just trigger yourself as hostile.
+- **What an anonymous visitor can reach:** `/healthz` (status and version), the
+  two discovery documents, `/register`, `/authorize` and the approval page
+  (useless without the password), `/token` and `/revoke` (useless without a
+  valid code or token). `/mcp` answers 401 with a pointer to the discovery
+  document.
+- **The static bearer token still works,** on the public URL too, and never
+  expires. It is as good as the owner password for reading the data, so keep
+  it as secret, or comment out `GARMIN_MCP_AUTH_TOKEN` and restart to make
+  OAuth the only way in. With a public URL set, the service refuses to start
+  if the token is shorter than 32 characters; the one the installer generated
+  is 64.
+- **Tokens.** OAuth tokens are stored as hashes and are only valid for this
+  server's endpoint. `sudo garmin-mcp revoke` ends a client's access at once.
+  Client secrets of clients that register with one are stored as they are,
+  because the server has to compare them; they are worthless without the
+  owner's approval.
+
+In both cases:
+
+- **`/healthz` is always open** and returns only a status and the version.
 - **Bind address and firewall.** The default `0.0.0.0` listens on every IPv4
-  interface. Set `GARMIN_MCP_HOST` to one LAN address to narrow that, and
-  restrict the port to the clients that need it in the machine's firewall.
-- **Host allowlist.** `GARMIN_MCP_ALLOWED_HOSTS` rejects requests whose `Host`
-  header is not listed, which protects against DNS rebinding from a browser on
-  the LAN. List every name and address that clients use in the URL, for
-  example `192.168.1.10:*,garmin.lan:*`. With the allowlist on, requests that
-  carry an `Origin` header (browsers send one) are rejected too.
+  interface. Set `GARMIN_MCP_HOST` to one LAN address, or to `127.0.0.1` behind
+  a local proxy, to narrow that, and restrict the port to the clients that
+  need it in the machine's firewall.
+- **Host allowlist.** `GARMIN_MCP_ALLOWED_HOSTS` rejects requests to the MCP
+  endpoint whose `Host` header is not listed, which protects against DNS
+  rebinding from a browser on the LAN. List every name and address that
+  clients use in the URL, for example
+  `192.168.1.10:*,garmin.lan:*,garmin.example.com`. With the allowlist on,
+  requests that carry an `Origin` header (browsers send one) are rejected too.
 - **Read-only.** The tools only read from Garmin Connect. None of them changes
   anything in the account.
-- **Secrets on disk.** The env file (bearer token, optionally the password) is
-  readable by root and the `garmin-mcp` group only. The token file grants
-  access to the Garmin account and is readable by the `garmin-mcp` user only.
+- **Secrets on disk.** The env file (bearer token, optionally the Garmin
+  password) is readable by root and the `garmin-mcp` group only. The Garmin
+  token file grants access to the Garmin account, and `oauth.db` holds the
+  password hash, the token hashes and client registrations; both are readable
+  by the `garmin-mcp` user only.
 - **Sandbox.** The service runs as an unprivileged user with no capabilities,
   a read-only view of the file system apart from `/var/lib/garmin-mcp`, no
   access to `/home`, and a system-call filter. The settings are in
@@ -196,11 +522,24 @@ sudo systemctl restart garmin-mcp    # apply a config change
 journalctl -u garmin-mcp -f          # follow the log
 journalctl -u garmin-mcp -e          # jump to the end of the log
 sudo garmin-mcp check                # do the Garmin tokens work?
+sudo garmin-mcp clients              # which OAuth clients are authorized?
+sudo garmin-mcp revoke <client_id>   # sign one of them out (or: revoke --all)
+sudo garmin-mcp set-password         # set or change the owner password
 ```
+
+`sudo garmin-mcp` runs each command as the `garmin-mcp` user with the env file
+and the state directory of the service, so the files it writes keep the right
+owner. Only `login` restarts the service; the OAuth commands take effect on
+the running service at once.
 
 The unit restarts the service 15 seconds after a crash, indefinitely. A service
 that keeps restarting usually has a bad value in the env file; the log shows
-the Python error.
+the error.
+
+All state is in `/var/lib/garmin-mcp`. To back it up, copy the whole directory:
+`oauth.db` alone is incomplete without its `-wal` file. Losing the directory
+costs a new Garmin login, a new owner password and approving the clients
+again.
 
 ### Upgrade
 
@@ -210,10 +549,13 @@ sudo ./install.sh
 ```
 
 Re-running the installer rebuilds the package in the virtualenv, replaces the
-unit and the wrapper, and restarts the service. It keeps the env file and the
-tokens. Compare your env file with
-`/etc/garmin-mcp/garmin-mcp.env.example` to see settings that a new version
-added.
+unit and the wrapper, and restarts the service. It keeps the env file, the
+Garmin tokens and the OAuth state, so authorized clients stay signed in.
+Compare your env file with `/etc/garmin-mcp/garmin-mcp.env.example` to see
+settings that a new version added.
+
+Upgrading from 0.1.0 needs nothing else. The OAuth settings are new and
+optional: until `GARMIN_MCP_PUBLIC_URL` is set, the server behaves as before.
 
 By default the installer only upgrades dependencies that no longer satisfy
 `pyproject.toml`. When Garmin has changed its API and a newer `garminconnect`
@@ -233,11 +575,13 @@ use another interpreter (`sudo PYTHON=/path/to/python3 ./install.sh`).
 
 ```sh
 sudo ./uninstall.sh            # remove the service, /opt/garmin-mcp and the wrapper
-sudo ./uninstall.sh --purge    # also remove the config, the tokens and the garmin-mcp user
+sudo ./uninstall.sh --purge    # also remove the config, the state and the garmin-mcp user
 ```
 
-Without `--purge` the config and tokens stay in `/etc/garmin-mcp` and
-`/var/lib/garmin-mcp`, and a later install picks them up again.
+Without `--purge` the config stays in `/etc/garmin-mcp` and the state (Garmin
+tokens, OAuth clients, owner password) in `/var/lib/garmin-mcp`, and a later
+install picks them up again. Removing the server does not remove a reverse
+proxy you set up in front of it.
 
 ## Development
 
@@ -252,13 +596,26 @@ uv run garmin-mcp serve      # serve on http://0.0.0.0:8765/mcp
 Outside systemd the settings come from the shell environment, for example
 `GARMIN_MCP_HOST=127.0.0.1 GARMIN_MCP_PORT=8766 uv run garmin-mcp serve`.
 
+To try the OAuth side locally, without TLS, use a `localhost` origin (the only
+case where `http` is accepted):
+
+```sh
+uv run garmin-mcp set-password       # stored in ~/.local/state/garmin-mcp/oauth.db
+GARMIN_MCP_PUBLIC_URL=http://localhost:8765 uv run garmin-mcp serve
+```
+
 Code layout:
 
 - `src/garmin_mcp/config.py` reads the settings from the environment.
 - `src/garmin_mcp/session.py` holds the single Garmin session: login, token
   reuse, the login cooldown, and the mapping of Garmin errors to tool errors.
 - `src/garmin_mcp/server.py` builds the MCP server and the HTTP app (bearer
-  token check, `/healthz`).
+  token check, OAuth wiring, `/healthz`).
+- `src/garmin_mcp/oauth.py` is the OAuth authorization server behind the MCP
+  SDK's endpoints: the SQLite store, codes and tokens, and the owner password.
+  `src/garmin_mcp/login.py` is the approval page and its rate limiter.
+- `src/garmin_mcp/cli.py` is the command line: `serve`, `login`, `check`,
+  `set-password`, `clients`, `revoke`.
 - `src/garmin_mcp/tools/` contains the tools, one module per area. Each module
   exposes `register(mcp, garmin)` and is listed in `MODULES` in
   `tools/__init__.py`. The conventions for writing a tool (date arguments,

@@ -5,16 +5,17 @@
 #
 # Safe to re-run: it rebuilds the package in /opt/garmin-mcp/venv, refreshes the
 # unit and the admin wrapper and restarts the service. The config in
-# /etc/garmin-mcp and the tokens in /var/lib/garmin-mcp are never overwritten.
+# /etc/garmin-mcp and the state in /var/lib/garmin-mcp (Garmin tokens, OAuth
+# clients and owner password) are never overwritten.
 # The package is installed as a copy, so this checkout is not needed afterwards
 # (keep it for upgrades and for uninstall.sh).
 #
 # Layout:
 #   /opt/garmin-mcp/venv                      virtualenv with the package
 #   /etc/garmin-mcp/garmin-mcp.env            settings and secrets (root:garmin-mcp 0640)
-#   /var/lib/garmin-mcp                       state: Garmin tokens (created by systemd)
+#   /var/lib/garmin-mcp                       state: Garmin tokens, OAuth database (created by systemd)
 #   /etc/systemd/system/garmin-mcp.service    the unit
-#   /usr/local/bin/garmin-mcp                 admin wrapper: sudo garmin-mcp login|check
+#   /usr/local/bin/garmin-mcp                 admin wrapper: sudo garmin-mcp login|check|set-password|...
 #
 # Environment:
 #   PYTHON   base interpreter for the virtualenv (default /usr/bin/python3, the
@@ -285,13 +286,21 @@ esac
 path=${path:-/mcp}
 [[ $path == /* ]] || path=/$path
 mcp_url="http://$lan_host:${port:-8765}$path"
+# Set when the built-in OAuth server is on (public access through a TLS proxy).
+public_url=$(service_env "$main_pid" GARMIN_MCP_PUBLIC_URL)
+while [[ $public_url == */ ]]; do public_url=${public_url%/}; done
+public_line=
+if [[ -n $public_url ]]; then
+    public_line="
+  Public URL     $public_url$path  (OAuth sign-in; reached through your TLS proxy)"
+fi
 
 cat <<EOF
 
 $installed_version is installed and running.
 
   Health check   $health_url  (OK)
-  MCP endpoint   $mcp_url  (streamable HTTP)
+  MCP endpoint   $mcp_url  (streamable HTTP)$public_line
   Config         $ENV_FILE
   Tokens         ${token_dir:-$STATE_DIR/tokens}
   Logs           journalctl -u garmin-mcp -f
@@ -300,7 +309,12 @@ Next steps:
 EOF
 
 step=1
-if [[ -z $(service_env "$main_pid" GARMIN_MCP_AUTH_TOKEN) ]]; then
+if [[ -n $(service_env "$main_pid" GARMIN_MCP_AUTH_TOKEN) ]]; then
+    token_note="     The token is in the config: sudo grep AUTH_TOKEN $ENV_FILE"
+elif [[ -n $public_url ]]; then
+    # OAuth guards the endpoint; running without the static token is a choice.
+    token_note=
+else
     cat <<EOF
   $step. GARMIN_MCP_AUTH_TOKEN is not set: anyone who can reach the port can read
      this Garmin account. Set it (generate one with: openssl rand -hex 32) in
@@ -308,8 +322,6 @@ if [[ -z $(service_env "$main_pid" GARMIN_MCP_AUTH_TOKEN) ]]; then
 EOF
     step=$((step + 1))
     token_note="     once GARMIN_MCP_AUTH_TOKEN is set."
-else
-    token_note="     The token is in the config: sudo grep AUTH_TOKEN $ENV_FILE"
 fi
 if [[ -s ${token_dir:-$STATE_DIR/tokens}/garmin_tokens.json ]]; then
     cat <<EOF
@@ -329,8 +341,23 @@ else
 EOF
 fi
 step=$((step + 1))
-cat <<EOF
+if [[ -n $public_url ]]; then
+    cat <<EOF
+  $step. Point MCP clients at $public_url$path
+     They sign in through OAuth: approving one in the browser needs the owner
+     password. If you have not set it yet: sudo garmin-mcp set-password
+EOF
+    if [[ -n $token_note ]]; then
+        cat <<EOF
+     Clients that send "Authorization: Bearer <token>" instead still work, also
+     on $mcp_url
+$token_note
+EOF
+    fi
+else
+    cat <<EOF
   $step. Point MCP clients at $mcp_url
      with the header "Authorization: Bearer <token>".
 $token_note
 EOF
+fi
