@@ -607,16 +607,22 @@ class GarminOAuthProvider(
         self,
         store: OAuthStore,
         *,
-        issuer: str,
-        resource_url: str,
+        issuer: str | None = None,
+        mcp_path: str = "/mcp",
         static_token: str | None = None,
         access_ttl: int = 3600,
         refresh_ttl: int = 30 * 24 * 3600,
     ) -> None:
         self.store = store
+        # ``issuer`` is the configured public origin (GARMIN_MCP_PUBLIC_URL).
+        # Without one the server answers to whatever address a client used to
+        # reach it, and ``issuer``/``resource_url`` are None.
         self.issuer = issuer
-        self.resource_url = resource_url
-        self._accepted_resources = {normalize_url(resource_url), normalize_url(issuer)}
+        self.mcp_path = mcp_path
+        self.resource_url = f"{issuer}{mcp_path}" if issuer else None
+        self._accepted_resources = (
+            {normalize_url(self.resource_url), normalize_url(issuer)} if issuer else None
+        )
         self._static_token = static_token.encode() if static_token else None
         self._access_ttl = access_ttl
         self._refresh_ttl = refresh_ttl
@@ -680,9 +686,20 @@ class GarminOAuthProvider(
                 wanted = normalize_url(params.resource)
             except ValueError:
                 wanted = None
-            if wanted not in self._accepted_resources:
+            if self._accepted_resources is not None:
+                acceptable = wanted in self._accepted_resources
+            else:
+                # No fixed address: the client names us by the address it used,
+                # which we cannot know in advance. Its path must still be ours.
+                acceptable = wanted is not None and urlsplit(wanted).path in (
+                    "",
+                    self.mcp_path.rstrip("/"),
+                )
+            if not acceptable:
                 raise AuthorizeError(
-                    "invalid_target", f"this server only issues tokens for {self.resource_url}"
+                    "invalid_target",
+                    "this server only issues tokens for its own MCP endpoint "
+                    f"({self.resource_url or self.mcp_path})",
                 )
         if not _CODE_CHALLENGE_RE.match(params.code_challenge):
             raise AuthorizeError("invalid_request", "code_challenge is not a valid S256 challenge")
@@ -703,7 +720,9 @@ class GarminOAuthProvider(
             ).encode()
         )
         txn = f"{payload}.{self._sign(payload.encode())}"
-        return construct_redirect_uri(self.issuer + LOGIN_PATH, txn=txn)
+        # Relative when there is no fixed address: the browser resolves it
+        # against the address it used for /authorize.
+        return construct_redirect_uri((self.issuer or "") + LOGIN_PATH, txn=txn)
 
     def pending(self, txn: str) -> PendingAuthorization | None:
         """Decode a transaction id; None if forged, expired, used, or its client is gone."""
@@ -881,7 +900,11 @@ class GarminOAuthProvider(
             client_id=stored.client_id,
             scopes=stored.scopes,
             expires_at=stored.expires_at,
-            resource=stored.resource,
+            # Tokens are opaque and only exist in this server's own database,
+            # so any token found there was issued for this server. Report the
+            # current address rather than the one recorded at issue time, so
+            # tokens survive GARMIN_MCP_PUBLIC_URL being set or changed.
+            resource=self.resource_url,
             subject=OWNER,
         )
 

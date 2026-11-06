@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "garmin-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "MCP server (streamable HTTP) exposing a personal Garmin Connect account"
 readme = "README.md"
 requires-python = ">=3.12"

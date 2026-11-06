@@ -12,7 +12,7 @@ import logging
 import time
 from collections import deque
 from html import escape
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 import anyio
 from starlette.requests import Request
@@ -250,7 +250,7 @@ async def _read_form(request: Request) -> dict[str, str] | None:
     return {name: values[0] for name, values in fields.items()}
 
 
-def _is_cross_site(request: Request, issuer: str) -> bool:
+def _is_cross_site(request: Request, issuer: str | None) -> bool:
     """True if a browser says this POST did not come from our own page."""
     if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
         return True
@@ -258,7 +258,12 @@ def _is_cross_site(request: Request, issuer: str) -> bool:
     if origin is None:
         return False  # non-browser client, or an old browser: nothing to go on
     try:
-        return normalize_url(origin) != normalize_url(issuer)
+        if issuer is not None:
+            return normalize_url(origin) != normalize_url(issuer)
+        # No fixed address: our own page is whatever host this request was
+        # sent to. (The scheme is left out: behind a TLS proxy the browser
+        # says https while this server sees http.)
+        return urlsplit(origin).netloc.lower() != request.headers.get("host", "").lower()
     except ValueError:
         return True  # "null" or garbage
 
@@ -280,7 +285,7 @@ def make_login_endpoint(provider: GarminOAuthProvider, path: str):
         if (
             not warned_no_forwarded_for
             and "x-forwarded-for" not in request.headers
-            and provider.issuer.startswith("https://")
+            and (provider.issuer or "").startswith("https://")
         ):
             # The public URL is https, so there is a proxy in front; if it does
             # not say who the client is, every visitor shares one bucket.

@@ -286,7 +286,12 @@ esac
 path=${path:-/mcp}
 [[ $path == /* ]] || path=/$path
 mcp_url="http://$lan_host:${port:-8765}$path"
-# Set when the built-in OAuth server is on (public access through a TLS proxy).
+# OAuth sign-in is on unless switched off. A public URL, if set, is the
+# address the server publishes for it (public access through a TLS proxy).
+oauth_on=true
+case "$(service_env "$main_pid" GARMIN_MCP_OAUTH | tr '[:upper:]' '[:lower:]')" in
+    0 | false | no | off) oauth_on=false ;;
+esac
 public_url=$(service_env "$main_pid" GARMIN_MCP_PUBLIC_URL)
 while [[ $public_url == */ ]]; do public_url=${public_url%/}; done
 public_line=
@@ -311,7 +316,7 @@ EOF
 step=1
 if [[ -n $(service_env "$main_pid" GARMIN_MCP_AUTH_TOKEN) ]]; then
     token_note="     The token is in the config: sudo grep AUTH_TOKEN $ENV_FILE"
-elif [[ -n $public_url ]]; then
+elif $oauth_on; then
     # OAuth guards the endpoint; running without the static token is a choice.
     token_note=
 else
@@ -354,10 +359,24 @@ EOF
 $token_note
 EOF
     fi
-else
+elif [[ -n $token_note ]]; then
     cat <<EOF
   $step. Point MCP clients at $mcp_url
      with the header "Authorization: Bearer <token>".
 $token_note
+EOF
+    if $oauth_on; then
+        cat <<EOF
+     Clients can also sign in with OAuth instead (set the owner password
+     first: sudo garmin-mcp set-password), but most only do that over HTTPS.
+EOF
+    fi
+else
+    cat <<EOF
+  $step. Point MCP clients at $mcp_url
+     They sign in through OAuth: approving one in the browser needs the owner
+     password. If you have not set it yet: sudo garmin-mcp set-password
+     Most clients only do OAuth over HTTPS; for plain HTTP on the LAN, set
+     GARMIN_MCP_AUTH_TOKEN in $ENV_FILE and use the header instead.
 EOF
 fi

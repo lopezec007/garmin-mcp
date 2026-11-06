@@ -5,10 +5,13 @@ Connect account (activities, sleep, heart rate, training metrics and so on). It
 serves the MCP streamable HTTP transport and runs as a sandboxed systemd
 service on a Debian 13 machine, without containers.
 
-Out of the box it is a service for the home network, protected by a bearer
-token. It can also be opened to the internet behind a TLS reverse proxy: it is
-then its own OAuth 2.1 authorization server, and every client has to be
-approved in a browser with a password that only the owner knows. See
+There are two ways in, and both are on out of the box. A client can send a
+bearer token in a header. Or it can sign in with OAuth: the server is its own
+OAuth 2.1 authorization server, and every client has to be approved in a
+browser with a password that only the owner knows. OAuth needs no
+configuration and no public address, but most clients only do it over HTTPS;
+see [Connecting clients](#connecting-clients). To open the server to the
+internet, put a TLS reverse proxy in front of it; see
 [Public access with OAuth](#public-access-with-oauth).
 
 It talks to Garmin through the unofficial
@@ -86,9 +89,10 @@ Every one is optional. Restart the service after a change
 | `GARMIN_IS_CN` | `false` | `true` for accounts on Garmin's China region. |
 | `GARMIN_TOKEN_DIR` | `/var/lib/garmin-mcp/tokens` | Where tokens are saved. Under systemd the default is `$STATE_DIRECTORY/tokens`; outside systemd it is `~/.garminconnect`. Leave unset on the server: the sandbox allows writes nowhere else. |
 | `GARMIN_MCP_LOGIN_COOLDOWN` | `300` | Seconds to wait after a failed Garmin login before trying again. |
-| `GARMIN_MCP_AUTH_TOKEN` | unset | Shared secret: an MCP request that carries `Authorization: Bearer <token>` is let in. Without `GARMIN_MCP_PUBLIC_URL`, unset means no authentication at all. With it, the token is a second way in next to OAuth, and unset leaves OAuth as the only one. |
+| `GARMIN_MCP_AUTH_TOKEN` | unset | Shared secret: an MCP request that carries `Authorization: Bearer <token>` is let in. It works next to OAuth; unset leaves OAuth as the only way in. With `GARMIN_MCP_OAUTH=off`, unset means no authentication at all. Must be at least 32 characters when `GARMIN_MCP_PUBLIC_URL` is set. |
+| `GARMIN_MCP_OAUTH` | `on` | The built-in OAuth sign-in. `off` removes the OAuth endpoints and leaves the bearer token as the only protection. Any other value is a configuration error. |
 | `GARMIN_MCP_ALLOWED_HOSTS` | unset | Comma-separated allowlist for the HTTP `Host` header on the MCP endpoint. An entry is `host:port`, `host:*` (any port, but the header must have one) or a bare `host` (a name used without a port, such as the public name behind a TLS proxy). Unset accepts any host. |
-| `GARMIN_MCP_PUBLIC_URL` | unset | The https origin the server is reachable at from the internet, for example `https://garmin.example.com`: scheme and host name, no path. Setting it turns on OAuth; the public endpoint is this value plus `GARMIN_MCP_PATH`. Plain `http` is accepted for `localhost` only. With a value that is not usable the service exits with a configuration error. |
+| `GARMIN_MCP_PUBLIC_URL` | unset | Optional. The origin the server is reachable at, for example `https://garmin.example.com`: scheme and host name, no path. Unset, the server names itself in the OAuth discovery documents by the address each request was sent to, so it works under any address without configuration. Set, it always uses this value, whatever a request claims; do that once the server is on the internet. Must be `https` (plain `http` is accepted for `localhost` only). With a value that is not usable the service exits with a configuration error. |
 | `GARMIN_MCP_TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated addresses or networks of the reverse proxies whose `X-Forwarded-For` header is believed. Only needs changing when the proxy runs on another machine. |
 | `GARMIN_MCP_OAUTH_ACCESS_TTL` | `3600` | Lifetime of an OAuth access token in seconds (at least 60). |
 | `GARMIN_MCP_OAUTH_REFRESH_TTL` | `2592000` | Lifetime of an OAuth refresh token in seconds (30 days; not shorter than the access token's). |
@@ -179,30 +183,43 @@ Clients configured through an `mcpServers` JSON block:
 Any client that supports streamable HTTP with custom headers can connect this
 way.
 
-**OAuth, through the public URL.** Once
-[public access](#public-access-with-oauth) is set up, the endpoint is
-`https://garmin.example.com/mcp`, and an MCP client that implements the MCP
-authorization flow (OAuth 2.1 with dynamic client registration) needs nothing
-but that URL:
+**OAuth.** An MCP client that implements the MCP authorization flow (OAuth 2.1
+with dynamic client registration) needs nothing but the endpoint URL:
 
 ```sh
 claude mcp add --transport http garmin https://garmin.example.com/mcp
 ```
 
 The client discovers the sign-in endpoints from the URL, registers itself, and
-sends your browser to the approval page, where you type the owner password.
-This is the way in for clients that only accept HTTPS or publicly reachable
-servers.
+sends your browser to the approval page, where you type the owner password
+(set it first: `sudo garmin-mcp set-password`). See
+[The approval page](#the-approval-page).
 
-The header method keeps working while `GARMIN_MCP_AUTH_TOKEN` is set, on the
-public URL as well as on the LAN address, for clients and scripts that cannot
-do OAuth. OAuth sign-in is tied to the public URL: a client that is pointed at
-the LAN address has to send the header.
+The server offers this under whatever address it is reached at, the LAN
+address included. Whether a client will use it there is up to the client, and
+the ones from Anthropic currently will not over plain HTTP:
+
+- **Claude Code** runs the OAuth flow, but, according to its documentation,
+  sends OAuth credentials only to a token endpoint that is HTTPS or on
+  `localhost`. Against `http://<server-ip>:8765/mcp` the sign-in stops with
+  "Refusing to send credentials to non-https token endpoint". The documented
+  way around it is the environment variable `MCP_SDK_GENERATION=v1`; the
+  documentation recommends serving HTTPS instead. Note also that Claude Code
+  does not try OAuth for a server that has an `Authorization` header
+  configured: use one method or the other.
+- **claude.ai, Claude Desktop and the mobile apps** (custom connectors)
+  connect from Anthropic's servers, not from your device. They cannot reach
+  an address that only exists on your network, whatever it serves.
+
+So in practice: on the plain-HTTP LAN address use the header; OAuth becomes
+useful once the server has HTTPS in front of it, which for the hosted clients
+also has to be reachable from the internet. The header method keeps working
+next to OAuth for as long as `GARMIN_MCP_AUTH_TOKEN` is set.
 
 ## Public access with OAuth
 
-Setting `GARMIN_MCP_PUBLIC_URL` makes the server an OAuth 2.1 authorization
-server for itself. It then serves, next to `/mcp`:
+The server is an OAuth 2.1 authorization server for itself (unless
+`GARMIN_MCP_OAUTH=off`). It serves, next to `/mcp`:
 
 - the discovery documents `/.well-known/oauth-protected-resource/mcp` and
   `/.well-known/oauth-authorization-server`,
@@ -257,6 +274,9 @@ only. It is not the Garmin password, and it is set on the server with
    ```
 
    `GARMIN_MCP_PUBLIC_URL` is the bare origin: no path and no trailing `/mcp`.
+   OAuth works without it, because the server otherwise goes by the address
+   each request arrives under. Set it anyway once the server is public: then
+   the addresses it publishes no longer depend on what a request claims.
    `GARMIN_MCP_HOST=127.0.0.1` makes the plain-HTTP port reachable through the
    local proxy only. Leave it at `0.0.0.0` only if clients on the LAN still
    connect to port 8765 directly with the bearer token. If you use
@@ -376,6 +396,15 @@ token and never expires.
   the client's cue to start the sign-in. A client that reports only "401" or
   "unauthorized" probably does not implement the OAuth flow: use the bearer
   token header with it.
+- **The discovery documents answer 404.** OAuth is switched off
+  (`GARMIN_MCP_OAUTH=off` in `/etc/garmin-mcp/garmin-mcp.env`). With it on,
+  the service logs `OAuth sign-in enabled` at startup. (Version 0.2.0 served
+  them only while `GARMIN_MCP_PUBLIC_URL` was set, and answered 401 otherwise,
+  which looked like the documents were behind the login.)
+- **Claude Code says "Refusing to send credentials to non-https token
+  endpoint".** It will not do OAuth against a plain-HTTP address other than
+  `localhost`. Use the bearer token header on the LAN, or put HTTPS in front
+  of the server; see [Connecting clients](#connecting-clients).
 - **The page says "Not set up yet" / no owner password.** Run
   `sudo garmin-mcp set-password` on the server, then start connecting again
   from the client.
@@ -391,11 +420,15 @@ token and never expires.
   than 5 minutes, was already used, or the service was restarted in between.
   Start connecting again from the client.
 - **The client fails before any page opens, or the browser goes to the wrong
-  host.** `GARMIN_MCP_PUBLIC_URL` does not match the URL clients use. The
-  discovery documents are built from that setting, not from the request, so a
-  wrong value sends clients to the wrong place. Compare the output of the
-  `curl` commands in step 4 with the URL you gave the client: scheme, host
-  name and path must be identical.
+  host.** The discovery documents name a different address than the one the
+  client uses. Compare the output of the `curl` commands in step 4 with the
+  URL you gave the client: scheme, host name and path must be identical. With
+  `GARMIN_MCP_PUBLIC_URL` set, the documents use that value, so fix the
+  value. Without it they use the `Host` header and the scheme of the request:
+  if they say `http` behind a TLS proxy, the proxy is not sending
+  `X-Forwarded-Proto` or is not listed in `GARMIN_MCP_TRUSTED_PROXIES`; if
+  the host is wrong, the proxy is rewriting `Host`. Setting
+  `GARMIN_MCP_PUBLIC_URL` settles both.
 - **The service does not start after the change.** `journalctl -u garmin-mcp -e`
   shows a line starting with `configuration error` that names the problem,
   usually a `GARMIN_MCP_PUBLIC_URL` with a path, or `http` instead of `https`.
@@ -422,14 +455,19 @@ token and never expires.
 
 ## Security notes
 
-For the home network only (no `GARMIN_MCP_PUBLIC_URL`):
+For the home network only:
 
-- **Plain HTTP.** Requests, responses and the bearer token cross the LAN
-  unencrypted. That is acceptable on a home network you trust and nowhere else.
-  Do not forward port 8765 to the internet.
-- **Bearer token.** Without `GARMIN_MCP_AUTH_TOKEN`, anyone who can reach the
-  port can read the account's health data. The service logs a warning at
-  startup while the token is unset.
+- **Plain HTTP.** Requests, responses, the bearer token and, if you sign in
+  with OAuth there, the owner password cross the LAN unencrypted. That is
+  acceptable on a home network you trust and nowhere else. Do not forward
+  port 8765 to the internet.
+- **Nothing is open by default.** The MCP endpoint needs the bearer token or
+  an OAuth sign-in. Only with `GARMIN_MCP_OAUTH=off` *and* no
+  `GARMIN_MCP_AUTH_TOKEN` can anyone who reaches the port read the account's
+  health data; the service logs a warning at startup in that state.
+- **The OAuth endpoints are there too.** Anyone on the network can reach the
+  registration endpoint and the approval page. Neither grants anything
+  without the owner password, and until one is set nobody can sign in at all.
 
 With public access:
 
@@ -554,8 +592,11 @@ Garmin tokens and the OAuth state, so authorized clients stay signed in.
 Compare your env file with `/etc/garmin-mcp/garmin-mcp.env.example` to see
 settings that a new version added.
 
-Upgrading from 0.1.0 needs nothing else. The OAuth settings are new and
-optional: until `GARMIN_MCP_PUBLIC_URL` is set, the server behaves as before.
+Upgrading from 0.1.0 needs nothing else. The bearer token keeps working as
+before. OAuth sign-in is on from the first start, and unusable until you set
+an owner password. One difference: a server that ran without
+`GARMIN_MCP_AUTH_TOKEN` was open to the whole network and is now closed; set
+`GARMIN_MCP_OAUTH=off` to get the open server back.
 
 By default the installer only upgrades dependencies that no longer satisfy
 `pyproject.toml`. When Garmin has changed its API and a newer `garminconnect`
@@ -596,12 +637,11 @@ uv run garmin-mcp serve      # serve on http://0.0.0.0:8765/mcp
 Outside systemd the settings come from the shell environment, for example
 `GARMIN_MCP_HOST=127.0.0.1 GARMIN_MCP_PORT=8766 uv run garmin-mcp serve`.
 
-To try the OAuth side locally, without TLS, use a `localhost` origin (the only
-case where `http` is accepted):
+To try the OAuth side locally, no TLS and no further settings are needed:
 
 ```sh
 uv run garmin-mcp set-password       # stored in ~/.local/state/garmin-mcp/oauth.db
-GARMIN_MCP_PUBLIC_URL=http://localhost:8765 uv run garmin-mcp serve
+uv run garmin-mcp serve              # sign-in at http://localhost:8765/mcp
 ```
 
 Code layout:

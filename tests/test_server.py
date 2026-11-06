@@ -43,6 +43,25 @@ def test_bearer_token_is_enforced(settings, garmin):
     assert ok.json()["result"]["tools"]
 
 
+def test_well_known_paths_are_not_behind_the_bearer_wall(settings, garmin):
+    # Without OAuth there is no metadata to serve. Clients probing for it must
+    # get an honest 404, not a 401 that suggests it exists but is protected.
+    app = build_app(replace(settings, auth_token="s3cret"), garmin)
+    with TestClient(app) as http:
+        for path in (
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/openid-configuration",
+        ):
+            assert http.get(path).status_code == 404, path
+        # Everything else stays closed, existing or not.
+        assert http.get("/nope").status_code == 401
+        assert http.get("/mcp").status_code == 401
+        assert http.get("/.well-known").status_code == 401
+        assert rpc(http, "tools/list").status_code == 401
+
+
 def test_tool_call_over_http(settings, garmin, fake):
     fake.responses["get_device_last_used"] = {"lastUsedDeviceName": "Forerunner", "x": None}
     with TestClient(build_app(settings, garmin)) as http:

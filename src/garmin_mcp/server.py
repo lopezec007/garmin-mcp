@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import hmac
 import logging
+import re
+from collections.abc import Callable
+from typing import Any
 
-from mcp.server.auth.handlers.metadata import MetadataHandler
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.auth import ProtectedResourceMetadata
 from starlette.applications import Starlette
-from starlette.requests import Request
+from starlette.requests import HTTPConnection, Request
 from starlette.responses import JSONResponse
+from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
@@ -37,15 +42,29 @@ Today's data is only as fresh as the watch's last sync.
 HEALTH_PATH = "/healthz"
 
 
+WELL_KNOWN_PREFIX = "/.well-known/"
+
+
 class BearerAuthMiddleware:
-    """Require ``Authorization: Bearer <token>`` on everything except the health check."""
+    """Require ``Authorization: Bearer <token>`` (the mode without OAuth).
+
+    Everything is guarded except the health check and ``/.well-known/``. The
+    latter serves nothing in this mode, and must say so honestly: clients
+    probe those paths to find out whether a server offers OAuth, and a 401
+    there reads as "there is OAuth metadata, but you may not see it" instead
+    of the true answer, a 404.
+    """
 
     def __init__(self, app: ASGIApp, token: str) -> None:
         self.app = app
         self._expected = f"Bearer {token}".encode()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] == HEALTH_PATH:
+        if (
+            scope["type"] != "http"
+            or scope["path"] == HEALTH_PATH
+            or scope["path"].startswith(WELL_KNOWN_PREFIX)
+        ):
             await self.app(scope, receive, send)
             return
         supplied = dict(scope["headers"]).get(b"authorization", b"")
@@ -112,49 +131,185 @@ class RevokeCompatMiddleware:
         await self.app(scope, replay, send)
 
 
-def _advertise_public_clients(app: Starlette, auth: AuthSettings) -> None:
-    """Say in the server metadata that clients without a secret are welcome.
+# Stand-in origin handed to the SDK when no public URL is configured. The SDK
+# wants a fixed https issuer at start-up; everything it would publish under
+# this name is rewritten per request to the address the client actually used.
+PLACEHOLDER_ORIGIN = "https://garmin-mcp.invalid"
 
-    The SDK accepts ``token_endpoint_auth_method: none`` at registration but
-    leaves it out of the metadata it publishes; clients that check first would
-    conclude they cannot connect.
+RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource"
+SERVER_METADATA_PATH = "/.well-known/oauth-authorization-server"
+
+_HOST_RE = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,253})|\[[0-9A-Fa-f:.]{2,45}\])(?::\d{1,5})?$"
+)
+
+OriginOf = Callable[[HTTPConnection], "str | None"]
+
+
+def make_origin_of(settings: Settings) -> OriginOf:
+    """How this server names itself to a given client: ``scheme://host[:port]``.
+
+    With GARMIN_MCP_PUBLIC_URL set, always that. Otherwise the address the
+    request was sent to (its Host header, and the scheme as seen by uvicorn,
+    which honours X-Forwarded-Proto from a trusted proxy), so the same server
+    answers correctly as http://192.168.1.10:8765, http://garmin.lan:8765 or
+    behind a proxy -- with nothing to configure. None if the request has no
+    usable Host header.
     """
-    metadata = build_metadata(
-        auth.issuer_url,  # as the SDK parsed it: no trailing slash added
+    if settings.public_url:
+        fixed = settings.public_url
+        return lambda _conn: fixed
+
+    def origin_of(conn: HTTPConnection) -> str | None:
+        host = conn.headers.get("host", "")
+        if not _HOST_RE.fullmatch(host):
+            return None
+        return f"{conn.scope.get('scheme', 'http')}://{host.lower()}"
+
+    return origin_of
+
+
+def _rebase(value: Any, old_origin: str, new_origin: str) -> Any:
+    """Replace ``old_origin`` at the start of every URL string in a JSON document."""
+    if isinstance(value, str):
+        if value == old_origin or value.startswith(old_origin + "/"):
+            return new_origin + value[len(old_origin) :]
+        return value
+    if isinstance(value, list):
+        return [_rebase(item, old_origin, new_origin) for item in value]
+    if isinstance(value, dict):
+        return {key: _rebase(item, old_origin, new_origin) for key, item in value.items()}
+    return value
+
+
+def _metadata_endpoint(document: dict[str, Any], template_origin: str, origin_of: OriginOf):
+    """Serve a discovery document with its URLs based on the caller's view of us."""
+
+    async def endpoint(request: Request) -> JSONResponse:
+        origin = origin_of(request)
+        if origin is None:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "missing or invalid Host header"},
+                status_code=400,
+            )
+        return JSONResponse(
+            _rebase(document, template_origin, origin),
+            # The content depends on the address used, so it must not be
+            # cached and replayed for a different one.
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return cors_middleware(endpoint, ["GET", "OPTIONS"])
+
+
+class RequireBearer:
+    """Guard the MCP endpoint: let authenticated requests through, challenge the rest.
+
+    Same job as the SDK's RequireAuthMiddleware, except that the challenge
+    points at the discovery document under the address the client used,
+    which the SDK can only do for one address fixed at start-up.
+    """
+
+    def __init__(self, app: ASGIApp, origin_of: OriginOf, mcp_path: str) -> None:
+        self.app = app
+        self._origin_of = origin_of
+        self._metadata_path = RESOURCE_METADATA_PATH + mcp_path
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if isinstance(scope.get("user"), AuthenticatedUser):
+            await self.app(scope, receive, send)
+            return
+        challenge = ['error="invalid_token"', 'error_description="Authentication required"']
+        origin = self._origin_of(HTTPConnection(scope))
+        if origin is not None:
+            challenge.append(f'resource_metadata="{origin}{self._metadata_path}"')
+        response = JSONResponse(
+            {"error": "invalid_token", "error_description": "Authentication required"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer " + ", ".join(challenge)},
+        )
+        await response(scope, receive, send)
+
+
+def _route(app: Starlette, path: str) -> Route:
+    for route in app.routes:
+        if getattr(route, "path", None) == path:
+            return route  # type: ignore[return-value]
+    raise RuntimeError(f"route {path} not found")
+
+
+def _install_oauth_routes(app: Starlette, settings: Settings, auth: AuthSettings) -> None:
+    """Adapt the routes the SDK built so they work under any address.
+
+    The SDK bakes one issuer URL into the two discovery documents and into
+    the 401 challenge. Replace those three with versions that use the
+    address of the request (or the configured public URL), and fill two
+    gaps while at it.
+    """
+    origin_of = make_origin_of(settings)
+    template_origin = str(auth.issuer_url)  # no trailing slash: see AuthSettings
+
+    server = build_metadata(
+        auth.issuer_url,
         None,
         ClientRegistrationOptions(enabled=True),
         RevocationOptions(enabled=True),
     )
-    metadata.token_endpoint_auth_methods_supported = [
+    # The SDK accepts clients without a secret but does not say so in the
+    # metadata; clients that check first would conclude they cannot connect.
+    server.token_endpoint_auth_methods_supported = [
         "none",
-        *(metadata.token_endpoint_auth_methods_supported or []),
+        *(server.token_endpoint_auth_methods_supported or []),
     ]
-    metadata.revocation_endpoint_auth_methods_supported = [
+    server.revocation_endpoint_auth_methods_supported = [
         "none",
-        *(metadata.revocation_endpoint_auth_methods_supported or []),
+        *(server.revocation_endpoint_auth_methods_supported or []),
     ]
-    for route in app.routes:
-        if getattr(route, "path", None) == "/.well-known/oauth-authorization-server":
-            route.app = cors_middleware(MetadataHandler(metadata).handle, ["GET", "OPTIONS"])
-            return
-    raise RuntimeError("authorization server metadata route not found")
+    _route(app, SERVER_METADATA_PATH).app = _metadata_endpoint(
+        server.model_dump(mode="json", exclude_none=True), template_origin, origin_of
+    )
+
+    resource = ProtectedResourceMetadata(
+        resource=auth.resource_server_url,
+        authorization_servers=[auth.issuer_url],
+    )
+    resource_endpoint = _metadata_endpoint(
+        resource.model_dump(mode="json", exclude_none=True), template_origin, origin_of
+    )
+    _route(app, RESOURCE_METADATA_PATH + settings.path).app = resource_endpoint
+    # RFC 9728 puts the document for https://host/mcp at .../oauth-protected-
+    # resource/mcp. Clients that probe the bare path first should find it too.
+    app.router.routes.append(
+        Route(RESOURCE_METADATA_PATH, endpoint=resource_endpoint, methods=["GET", "OPTIONS"])
+    )
+
+    mcp_route = _route(app, settings.path)
+    mcp_route.app = RequireBearer(mcp_route.app.app, origin_of, settings.path)  # type: ignore[attr-defined]
 
 
 def build_oauth_provider(settings: Settings) -> GarminOAuthProvider:
-    assert settings.public_url and settings.resource_url
     provider = GarminOAuthProvider(
         OAuthStore(settings.oauth_db),
         issuer=settings.public_url,
-        resource_url=settings.resource_url,
+        mcp_path=settings.path,
         static_token=settings.auth_token,
         access_ttl=settings.oauth_access_ttl,
         refresh_ttl=settings.oauth_refresh_ttl,
     )
     if provider.store.password_hash() is None:
-        logger.warning(
-            "OAuth is enabled but no owner password is set, so no client can be authorized. "
-            "Run `garmin-mcp set-password` (installed service: `sudo garmin-mcp set-password`)."
-        )
+        hint = "Run `garmin-mcp set-password` (installed service: `sudo garmin-mcp set-password`)."
+        if settings.auth_token is None:
+            logger.warning(
+                "No owner password and no GARMIN_MCP_AUTH_TOKEN are set, so nothing can "
+                "connect yet. %s",
+                hint,
+            )
+        elif settings.public_url:
+            logger.warning(
+                "No owner password is set, so no client can sign in with OAuth. %s", hint
+            )
+        else:
+            logger.info("OAuth sign-in becomes available once an owner password is set. %s", hint)
     return provider
 
 
@@ -164,13 +319,17 @@ def build_server(settings: Settings, garmin: GarminSession | None = None) -> MCP
     provider = None
     if settings.oauth_enabled:
         provider = build_oauth_provider(settings)
+        origin = settings.public_url or PLACEHOLDER_ORIGIN
         oauth = {
             "auth_server_provider": provider,
             "auth": AuthSettings(
-                issuer_url=settings.public_url,
-                resource_server_url=settings.resource_url,
-                # Tokens are bound to this endpoint; refuse any that are not.
-                validate_token_resource=True,
+                issuer_url=origin,
+                resource_server_url=f"{origin}{settings.path}",
+                # With a fixed public address, insist that tokens name it.
+                # Without one there is no address to insist on; tokens are
+                # opaque and checked against this server's own database
+                # either way.
+                validate_token_resource=settings.public_url is not None,
                 client_registration_options=ClientRegistrationOptions(enabled=True),
                 revocation_options=RevocationOptions(enabled=True),
             ),
@@ -219,22 +378,21 @@ def build_app(settings: Settings, garmin: GarminSession | None = None) -> Starle
         host=settings.host,
     )
     if settings.oauth_enabled:
-        # The SDK's bearer middleware guards the MCP endpoint. It accepts OAuth
+        # The SDK's bearer middleware authenticates requests: it accepts OAuth
         # access tokens and, if configured, GARMIN_MCP_AUTH_TOKEN (see
         # GarminOAuthProvider.load_access_token).
-        _advertise_public_clients(app, mcp.settings.auth)
+        _install_oauth_routes(app, settings, mcp.settings.auth)
         app.add_middleware(RevokeCompatMiddleware)
         logger.info(
-            "OAuth enabled: public endpoint %s, sign-in at %s",
-            settings.resource_url,
-            settings.public_url,
+            "OAuth sign-in enabled; clients are told to use %s",
+            settings.public_url or "the address they connected to",
         )
     elif settings.auth_token:
         app.add_middleware(BearerAuthMiddleware, token=settings.auth_token)
     else:
         logger.warning(
-            "GARMIN_MCP_AUTH_TOKEN is not set: anyone who can reach %s:%s can read "
-            "this Garmin account's data.",
+            "OAuth is off and GARMIN_MCP_AUTH_TOKEN is not set: anyone who can reach %s:%s "
+            "can read this Garmin account's data.",
             settings.host,
             settings.port,
         )

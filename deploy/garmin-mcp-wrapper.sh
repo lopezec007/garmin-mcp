@@ -31,7 +31,7 @@ Garmin account:
                        and MFA code as needed), save tokens, then restart the service
   check                verify that the saved tokens or credentials work
 
-Public access through OAuth (on when GARMIN_MCP_PUBLIC_URL is set in the config):
+OAuth sign-in (on unless GARMIN_MCP_OAUTH=off in the config):
   set-password         set the owner password that the approval page asks for
                        (prompts twice; without a terminal, reads one line from
                        standard input)

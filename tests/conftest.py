@@ -57,7 +57,15 @@ def anyio_backend() -> str:
 
 @pytest.fixture
 def settings(tmp_path) -> Settings:
-    return Settings(email="me@example.com", password="pw", token_dir=tmp_path / "tokens")
+    # OAuth off by default here: most tests are about the tools, and the ones
+    # about the HTTP layer switch it on explicitly.
+    return Settings(
+        email="me@example.com",
+        password="pw",
+        token_dir=tmp_path / "tokens",
+        oauth=False,
+        oauth_db=tmp_path / "oauth.db",
+    )
 
 
 @pytest.fixture

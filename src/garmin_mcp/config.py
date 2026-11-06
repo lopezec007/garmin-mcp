@@ -23,6 +23,18 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in _TRUE
 
 
+def _env_switch(name: str, default: bool) -> bool:
+    """A security-relevant on/off setting: a typo must not silently mean "off"."""
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name}={raw!r} is not usable: use 'on' or 'off'")
+
+
 def _env_list(name: str) -> list[str]:
     return [item.strip() for item in os.environ.get(name, "").split(",") if item.strip()]
 
@@ -74,8 +86,14 @@ class Settings:
     # Optional shared secret. When set, clients must send
     # ``Authorization: Bearer <token>`` on every MCP request.
     auth_token: str | None = field(default=None, repr=False)
-    # The https origin clients reach this server at, e.g. https://garmin.example.com.
-    # Setting it turns on the built-in OAuth authorization server.
+    # The built-in OAuth authorization server: clients sign in through a
+    # browser page protected by the owner password. On by default; with it off
+    # the only protection is ``auth_token`` (and without that, none).
+    oauth: bool = True
+    # Optional: the origin clients reach this server at, e.g.
+    # https://garmin.example.com. Pins the address published in the OAuth
+    # discovery documents instead of taking it from each request. Set it once
+    # the server is exposed publicly.
     public_url: str | None = None
     oauth_db: Path = field(default_factory=_default_oauth_db)
     oauth_access_ttl: int = 3600
@@ -110,7 +128,7 @@ class Settings:
 
     @property
     def oauth_enabled(self) -> bool:
-        return self.public_url is not None
+        return self.oauth
 
     @property
     def resource_url(self) -> str | None:
@@ -133,6 +151,7 @@ class Settings:
             port=int(os.environ.get("GARMIN_MCP_PORT", "8765")),
             path=path,
             auth_token=os.environ.get("GARMIN_MCP_AUTH_TOKEN") or None,
+            oauth=_env_switch("GARMIN_MCP_OAUTH", default=True),
             public_url=os.environ.get("GARMIN_MCP_PUBLIC_URL", "").strip() or None,
             oauth_db=Path(oauth_db).expanduser() if oauth_db else _default_oauth_db(),
             oauth_access_ttl=int(os.environ.get("GARMIN_MCP_OAUTH_ACCESS_TTL", "3600")),

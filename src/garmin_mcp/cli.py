@@ -94,7 +94,7 @@ def cmd_set_password(settings: Settings, args: argparse.Namespace) -> int:
     print("Owner password set. It takes effect immediately; no restart needed.")
     print("Clients that are already authorized stay authorized (see `garmin-mcp revoke`).")
     if not settings.oauth_enabled:
-        print("Note: OAuth is off until GARMIN_MCP_PUBLIC_URL is set in the configuration.")
+        print("Note: OAuth is switched off in the configuration (GARMIN_MCP_OAUTH).")
     return 0
 
 

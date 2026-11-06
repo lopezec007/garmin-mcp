@@ -47,7 +47,7 @@ MCP_HEADERS = {
 
 @pytest.fixture
 def oauth_settings(settings, tmp_path) -> Settings:
-    return replace(settings, public_url=PUBLIC, oauth_db=tmp_path / "oauth.db")
+    return replace(settings, oauth=True, public_url=PUBLIC, oauth_db=tmp_path / "oauth.db")
 
 
 @pytest.fixture
@@ -169,6 +169,18 @@ def test_discovery_documents(http):
     assert server["code_challenge_methods_supported"] == ["S256"]
     # Clients without a secret (most MCP clients) must see they are supported.
     assert "none" in server["token_endpoint_auth_methods_supported"]
+
+
+def test_discovery_needs_no_credentials(http):
+    # A client has no token yet when it looks these up.
+    suffixed = http.get("/.well-known/oauth-protected-resource/mcp")
+    bare = http.get("/.well-known/oauth-protected-resource")
+    assert suffixed.status_code == bare.status_code == 200
+    assert bare.json() == suffixed.json()
+    assert http.get("/.well-known/oauth-authorization-server").status_code == 200
+    # Paths that do not exist say so; they do not ask for a login.
+    for path in ("/.well-known/openid-configuration", "/.well-known/nope", "/nope"):
+        assert http.get(path).status_code == 404, path
 
 
 def test_unauthenticated_request_points_at_the_metadata(http):
@@ -839,7 +851,226 @@ def test_public_url_is_normalised():
     settings = Settings(public_url="https://garmin.example.com/", path="/mcp")
     assert settings.public_url == "https://garmin.example.com"
     assert settings.resource_url == "https://garmin.example.com/mcp"
-    assert Settings().oauth_enabled is False
+    assert Settings().oauth_enabled is True  # on by default, public URL or not
+    assert Settings().public_url is None and Settings().resource_url is None
+
+
+# --- no public URL configured: the server answers to whatever address is used ---------------
+
+LAN = "http://192.168.1.50:8765"
+
+
+@pytest.fixture
+def lan(settings, garmin, tmp_path):
+    lan_settings = replace(
+        settings, oauth=True, oauth_db=tmp_path / "lan-oauth.db", auth_token=STATIC_TOKEN
+    )
+    assert lan_settings.public_url is None
+    OAuthStore(lan_settings.oauth_db).set_password(PASSWORD)
+    with TestClient(build_app(lan_settings, garmin), base_url=LAN) as client:
+        yield client
+
+
+def lan_sign_in(http, origin: str = LAN) -> tuple[str, dict]:
+    client_id = register(http)["client_id"]
+    response = http.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": REDIRECT,
+            "code_challenge": CHALLENGE,
+            "state": "xyz",
+            "resource": f"{origin}/mcp",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 302, response.text
+    # Relative: the browser stays on whatever address it used.
+    assert response.headers["location"].startswith("/oauth/login?txn=")
+    txn = parse_qs(urlsplit(response.headers["location"]).query)["txn"][0]
+    assert http.get("/oauth/login", params={"txn": txn}).status_code == 200
+    approved = http.post(
+        "/oauth/login",
+        data={"txn": txn, "password": PASSWORD, "action": "approve"},
+        headers={"Origin": origin},
+        follow_redirects=False,
+    )
+    tokens = exchange(http, client_id, code_from(approved))
+    assert tokens.status_code == 200, tokens.text
+    return client_id, tokens.json()
+
+
+def test_discovery_uses_the_address_the_client_connected_to(lan):
+    resource = lan.get("/.well-known/oauth-protected-resource/mcp")
+    assert resource.status_code == 200
+    assert resource.json()["resource"] == f"{LAN}/mcp"
+    assert resource.json()["authorization_servers"] == [LAN]
+    assert lan.get("/.well-known/oauth-protected-resource").json() == resource.json()
+
+    server = lan.get("/.well-known/oauth-authorization-server").json()
+    assert server["issuer"] == LAN
+    assert server["authorization_endpoint"] == f"{LAN}/authorize"
+    assert server["token_endpoint"] == f"{LAN}/token"
+    assert server["registration_endpoint"] == f"{LAN}/register"
+    assert (
+        "garmin-mcp.invalid"
+        not in resource.text + lan.get("/.well-known/oauth-authorization-server").text
+    )
+
+    # The same server reached under another name describes itself by that name.
+    by_name = {"Host": "garmin.lan:8765"}
+    assert (
+        lan.get("/.well-known/oauth-authorization-server", headers=by_name).json()["issuer"]
+        == "http://garmin.lan:8765"
+    )
+    assert (
+        lan.get("/.well-known/oauth-protected-resource/mcp", headers=by_name).json()["resource"]
+        == "http://garmin.lan:8765/mcp"
+    )
+
+
+def test_discovery_behind_a_tls_proxy_without_configuration(settings, garmin, tmp_path):
+    # uvicorn sets the scheme from X-Forwarded-Proto of a trusted proxy; the
+    # proxy keeps the Host header. Nothing else is needed.
+    app = build_app(replace(settings, oauth=True, oauth_db=tmp_path / "o.db"), garmin)
+    with TestClient(app, base_url="https://garmin.example.com") as http:
+        assert (
+            http.get("/.well-known/oauth-authorization-server").json()["issuer"]
+            == "https://garmin.example.com"
+        )
+        challenge = list_tools(http, None).headers["www-authenticate"]
+    assert (
+        'resource_metadata="https://garmin.example.com/.well-known/oauth-protected-resource/mcp"'
+        in challenge
+    )
+
+
+def test_challenge_points_at_the_address_used(lan):
+    response = list_tools(lan, None)
+    assert response.status_code == 401
+    assert (
+        f'resource_metadata="{LAN}/.well-known/oauth-protected-resource/mcp"'
+        in response.headers["www-authenticate"]
+    )
+
+
+def test_unusable_host_header_is_not_echoed(lan):
+    bad = {"Host": 'evil"host<x>'}
+    assert lan.get("/.well-known/oauth-authorization-server", headers=bad).status_code == 400
+    assert lan.get("/.well-known/oauth-protected-resource", headers=bad).status_code == 400
+    response = list_tools(lan, None)
+    challenged = lan.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        headers={**MCP_HEADERS, **bad},
+    )
+    assert response.status_code == challenged.status_code == 401
+    assert "evil" not in challenged.headers["www-authenticate"]
+
+
+def test_full_flow_without_a_public_url(lan):
+    _, tokens = lan_sign_in(lan)
+    assert list_tools(lan, tokens["access_token"]).status_code == 200
+    # The token is for this server, whatever name the client uses next time.
+    headers = {
+        **MCP_HEADERS,
+        "Authorization": f"Bearer {tokens['access_token']}",
+        "Host": "garmin.lan:8765",
+    }
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    assert lan.post("/mcp", json=body, headers=headers).status_code == 200
+    assert list_tools(lan, STATIC_TOKEN).status_code == 200  # the static token still works
+
+
+def test_resource_must_still_be_the_mcp_endpoint_without_a_public_url(lan):
+    client_id = register(lan)["client_id"]
+
+    def authorize(resource):
+        return lan.get(
+            "/authorize",
+            params={
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": REDIRECT,
+                "code_challenge": CHALLENGE,
+                "resource": resource,
+            },
+            follow_redirects=False,
+        ).headers["location"]
+
+    assert authorize(f"{LAN}/mcp").startswith("/oauth/login")
+    assert authorize("http://garmin.lan:8765/mcp/").startswith("/oauth/login")
+    assert authorize(LAN).startswith("/oauth/login")
+    assert "error=invalid_target" in authorize(f"{LAN}/something-else")
+    assert "error=invalid_target" in authorize("not a url")
+
+
+def test_cross_site_check_without_a_public_url(lan):
+    client_id = register(lan)["client_id"]
+    location = lan.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": REDIRECT,
+            "code_challenge": CHALLENGE,
+            "state": "xyz",
+        },
+        follow_redirects=False,
+    ).headers["location"]
+    form = {
+        "txn": parse_qs(urlsplit(location).query)["txn"][0],
+        "password": PASSWORD,
+        "action": "approve",
+    }
+    other_site = lan.post("/oauth/login", data=form, headers={"Origin": "http://evil.example"})
+    assert other_site.status_code == 403
+    # Behind a TLS proxy the browser's origin is https while we see http.
+    same_host = lan.post(
+        "/oauth/login",
+        data=form,
+        headers={"Origin": "https://192.168.1.50:8765"},
+        follow_redirects=False,
+    )
+    code_from(same_host)
+
+
+def test_tokens_survive_a_public_url_being_configured_later(settings, garmin, tmp_path):
+    lan_settings = replace(settings, oauth=True, oauth_db=tmp_path / "o.db")
+    OAuthStore(lan_settings.oauth_db).set_password(PASSWORD)
+    with TestClient(build_app(lan_settings, garmin), base_url=LAN) as http:
+        _, tokens = lan_sign_in(http)
+    public = replace(lan_settings, public_url="https://garmin.example.com")
+    with TestClient(build_app(public, garmin), base_url="https://garmin.example.com") as http:
+        assert list_tools(http, tokens["access_token"]).status_code == 200
+        assert (
+            http.get("/.well-known/oauth-authorization-server").json()["issuer"]
+            == "https://garmin.example.com"
+        )
+
+
+def test_oauth_switch(monkeypatch, tmp_path):
+    monkeypatch.setenv("GARMIN_MCP_OAUTH_DB", str(tmp_path / "o.db"))
+    monkeypatch.delenv("GARMIN_MCP_PUBLIC_URL", raising=False)
+    monkeypatch.delenv("GARMIN_MCP_OAUTH", raising=False)
+    assert Settings.from_env().oauth_enabled is True
+    for value, expected in (("off", False), ("0", False), ("on", True), ("TRUE", True)):
+        monkeypatch.setenv("GARMIN_MCP_OAUTH", value)
+        assert Settings.from_env().oauth_enabled is expected
+    # A typo must not silently switch the protection off.
+    monkeypatch.setenv("GARMIN_MCP_OAUTH", "of")
+    with pytest.raises(ValueError, match="GARMIN_MCP_OAUTH"):
+        Settings.from_env()
+
+
+def test_oauth_off_restores_plain_token_mode(settings, garmin):
+    app = build_app(replace(settings, oauth=False, auth_token=STATIC_TOKEN), garmin)
+    with TestClient(app, base_url=LAN) as http:
+        assert http.get("/.well-known/oauth-authorization-server").status_code == 404
+        assert http.post("/register", json={"redirect_uris": [REDIRECT]}).status_code == 401
+        assert list_tools(http, None).status_code == 401
+        assert list_tools(http, STATIC_TOKEN).status_code == 200
 
 
 # --- admin commands --------------------------------------------------------------------------
@@ -866,7 +1097,7 @@ def test_cli_set_password_from_stdin(cli_env, monkeypatch, capsys):
 
 def test_cli_clients_and_revoke(cli_env, garmin, settings, capsys):
     OAuthStore(cli_env).set_password(PASSWORD)
-    app = build_app(replace(settings, public_url=PUBLIC, oauth_db=cli_env), garmin)
+    app = build_app(replace(settings, oauth=True, public_url=PUBLIC, oauth_db=cli_env), garmin)
     with TestClient(app, base_url=PUBLIC) as http:
         client_id, tokens = sign_in(http)
 
@@ -896,7 +1127,7 @@ def test_cli_refuses_to_invent_a_database(cli_env, capsys):
 
 def test_cli_does_not_print_client_text_raw(cli_env, garmin, settings, capsys):
     OAuthStore(cli_env).set_password(PASSWORD)
-    app = build_app(replace(settings, public_url=PUBLIC, oauth_db=cli_env), garmin)
+    app = build_app(replace(settings, oauth=True, public_url=PUBLIC, oauth_db=cli_env), garmin)
     with TestClient(app, base_url=PUBLIC) as http:
         client_id = register(http, client_name="evil\x1b[2J\nfake-id  Trusted")["client_id"]
         code = code_from(approve(http, start_authorization(http, client_id)))
