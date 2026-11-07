@@ -768,3 +768,7 @@ full description and parameters are served to clients through `tools/list`.
 | `get_training_plan` | Details of one training plan |
 | `list_courses` | The user's saved courses (routes to follow on a device) |
 | `get_course` | One saved course |
+
+## License
+
+[0BSD](LICENSE): do whatever you like with it, no attribution required, no warranty.
