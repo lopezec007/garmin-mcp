@@ -419,6 +419,15 @@ token and never expires.
 - **The page says "Request expired".** The approval page was open for more
   than 5 minutes, was already used, or the service was restarted in between.
   Start connecting again from the client.
+- **The page says "Request refused: this form must be submitted from its own
+  page".** The browser's `Origin` header did not match the address the server
+  thinks it has (the log line `Approval form refused` shows both). Without
+  `GARMIN_MCP_PUBLIC_URL`, that address is the `Host` header, and a reverse
+  proxy may replace it with the backend address it was configured with (nginx
+  does unless told `proxy_set_header Host $host;`). Set
+  `GARMIN_MCP_PUBLIC_URL`, or have the proxy pass `Host` (or
+  `X-Forwarded-Host`) through. Versions before 0.2.2 also refused the form in
+  that situation from browsers that vouched for it themselves; upgrade.
 - **The client fails before any page opens, or the browser goes to the wrong
   host.** The discovery documents name a different address than the one the
   client uses. Compare the output of the `curl` commands in step 4 with the

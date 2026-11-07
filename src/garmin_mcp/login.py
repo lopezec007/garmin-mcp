@@ -250,22 +250,55 @@ async def _read_form(request: Request) -> dict[str, str] | None:
     return {name: values[0] for name, values in fields.items()}
 
 
+def _authority(value: str) -> str:
+    """``host[:port]`` of a URL or Host header, lower-cased, default ports dropped."""
+    value = value.strip().lower()
+    netloc = urlsplit(value).netloc if "://" in value else value
+    if netloc.endswith((":80", ":443")):
+        netloc = netloc.rsplit(":", 1)[0]
+    return netloc
+
+
 def _is_cross_site(request: Request, issuer: str | None) -> bool:
-    """True if a browser says this POST did not come from our own page."""
-    if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+    """True if a browser says this POST did not come from our own page.
+
+    The password is what actually protects the form; this only turns away a
+    request that visibly came from elsewhere, so it errs on the side of
+    letting a request through when the headers are ambiguous.
+    """
+    site = request.headers.get("sec-fetch-site", "").lower()
+    if site == "cross-site":
         return True
+    if site == "same-origin":
+        return False  # a modern browser vouches for it, whatever a proxy did to Host
     origin = request.headers.get("origin")
     if origin is None:
         return False  # non-browser client, or an old browser: nothing to go on
     try:
         if issuer is not None:
             return normalize_url(origin) != normalize_url(issuer)
-        # No fixed address: our own page is whatever host this request was
-        # sent to. (The scheme is left out: behind a TLS proxy the browser
-        # says https while this server sees http.)
-        return urlsplit(origin).netloc.lower() != request.headers.get("host", "").lower()
     except ValueError:
         return True  # "null" or garbage
+    # No fixed address: our own page is whatever host this request was sent
+    # to. The scheme is left out (behind a TLS proxy the browser says https
+    # while this server sees http), and the proxy may have replaced Host with
+    # our own address, in which case X-Forwarded-Host still says what the
+    # browser used. A browser cannot set either header on a cross-site POST.
+    ours = {
+        _authority(value)
+        for header in ("host", "x-forwarded-host")
+        for value in request.headers.get(header, "").split(",")
+        if value.strip()
+    }
+    if _authority(origin) in ours:
+        return False
+    logger.warning(
+        "Approval form refused: Origin %s does not match the Host this server sees (%s). "
+        "If a reverse proxy rewrites the Host header, set GARMIN_MCP_PUBLIC_URL.",
+        printable(origin, 100),
+        printable(request.headers.get("host", ""), 100),
+    )
+    return True
 
 
 def make_login_endpoint(provider: GarminOAuthProvider, path: str):

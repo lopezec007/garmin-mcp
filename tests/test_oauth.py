@@ -1026,6 +1026,15 @@ def test_cross_site_check_without_a_public_url(lan):
     }
     other_site = lan.post("/oauth/login", data=form, headers={"Origin": "http://evil.example"})
     assert other_site.status_code == 403
+    # An old browser's cross-site post is not rescued by a proxy header it did not send.
+    assert (
+        lan.post(
+            "/oauth/login",
+            data=form,
+            headers={"Origin": "http://evil.example", "Sec-Fetch-Site": "same-site"},
+        ).status_code
+        == 403
+    )
     # Behind a TLS proxy the browser's origin is https while we see http.
     same_host = lan.post(
         "/oauth/login",
@@ -1034,6 +1043,43 @@ def test_cross_site_check_without_a_public_url(lan):
         follow_redirects=False,
     )
     code_from(same_host)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        # A modern browser says the form came from our own page; the proxy
+        # (nginx by default, ngrok with host rewriting) replaced Host with the
+        # backend address it was configured with.
+        {"Origin": "https://garmin.example.com", "Sec-Fetch-Site": "same-origin"},
+        # Same, from a browser without Sec-Fetch-Site: X-Forwarded-Host tells.
+        {"Origin": "https://garmin.example.com", "X-Forwarded-Host": "garmin.example.com"},
+        {"Origin": "https://garmin.example.com", "X-Forwarded-Host": "garmin.example.com:443"},
+        # Explicit default port on one side only.
+        {"Origin": "https://garmin.example.com", "X-Forwarded-Host": "GARMIN.example.com, lb"},
+    ],
+    ids=["sec-fetch-site", "forwarded-host", "forwarded-host-port", "forwarded-host-chain"],
+)
+def test_form_post_through_a_proxy_that_rewrites_host(lan, headers):
+    client_id = register(lan)["client_id"]
+    location = lan.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": REDIRECT,
+            "code_challenge": CHALLENGE,
+            "state": "xyz",
+        },
+        follow_redirects=False,
+    ).headers["location"]
+    form = {
+        "txn": parse_qs(urlsplit(location).query)["txn"][0],
+        "password": PASSWORD,
+        "action": "approve",
+    }
+    # The TestClient's Host header is 192.168.1.50:8765, nothing like the Origin.
+    code_from(lan.post("/oauth/login", data=form, headers=headers, follow_redirects=False))
 
 
 def test_tokens_survive_a_public_url_being_configured_later(settings, garmin, tmp_path):
